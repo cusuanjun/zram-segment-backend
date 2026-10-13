@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+"""
+Defines kernel targets which are aliases of real kernel targets from the kernel
+package selected by --kernel_package=<package>.
+"""
+
+load("@bazel_skylib//rules:common_settings.bzl", "string_flag")
+load("//common:modules.bzl", "get_gki_modules_list")
+load("//private/devices/google/common/kleaf:kernel_aliases.bzl", "kernel_aliases")
+
+package(
+    default_visibility = [
+        "//visibility:public",
+    ],
+)
+
+_KERNEL_TARGETS = [
+    "all_headers_aarch64",
+    "android/abi_gki_aarch64_pixel",
+    "kernel_aarch64",
+    "kernel_aarch64_config",
+    "kernel_aarch64_download_or_build",
+    "kernel_aarch64_gki_artifacts",
+    "kernel_aarch64_gki_artifacts_download_or_build",
+    "kernel_aarch64_headers",
+    "kernel_aarch64_headers_download_or_build",
+    "kernel_aarch64_images",
+    "kernel_aarch64_images_download_or_build",
+    "kernel_aarch64_sources",
+    "set_kernel_dir_build_config",
+] + [
+    "kernel_aarch64/{}".format(m)
+    for m in get_gki_modules_list("arm64")
+]
+
+_KERNEL_PACKAGES = [
+    "@//aosp",
+    "@//aosp-staging",
+]
+
+string_flag(
+    name = "kernel_package",
+    values = _KERNEL_PACKAGES,
+    build_setting_default = "@//aosp",
+)
+
+kernel_aliases(
+    name = "kernel_aliases",
+    flag = ":kernel_package",
+    targets = _KERNEL_TARGETS,
+    packages = _KERNEL_PACKAGES,
+)
