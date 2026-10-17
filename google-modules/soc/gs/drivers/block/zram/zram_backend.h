@@ -4,11 +4,7 @@
 
 #include <linux/types.h>
 
-/* Owner identity supplied by callers; zero id means unknown. */
-struct zram_backend_owner {
-	u64 id;
-	u64 generation;
-};
+#include "zram_owner.h"
 
 struct zram;
 

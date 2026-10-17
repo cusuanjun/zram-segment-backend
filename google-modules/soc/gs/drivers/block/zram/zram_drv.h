@@ -19,6 +19,8 @@
 #include <linux/zsmalloc.h>
 #include <linux/crypto.h>
 
+#include "zram_owner.h"
+
 #define SECTORS_PER_PAGE_SHIFT	(PAGE_SHIFT - SECTOR_SHIFT)
 #define SECTORS_PER_PAGE	(1 << SECTORS_PER_PAGE_SHIFT)
 #define ZRAM_LOGICAL_BLOCK_SHIFT 12
@@ -60,6 +62,10 @@ struct zram_table_entry {
 		unsigned long element;
 	};
 	unsigned long flags;
+#ifdef CONFIG_ZRAM_SEGMENT_BACKEND
+	/* Snapshot of app identity, protected by the slot lock. */
+	struct zram_backend_owner owner;
+#endif
 #ifdef CONFIG_ZRAM_MEMORY_TRACKING
 	ktime_t ac_time;
 #endif
@@ -99,6 +105,7 @@ struct zram {
 	struct zcomp *comp;
 #ifdef CONFIG_ZRAM_SEGMENT_BACKEND
 	struct zram_backend *backend;
+	struct zram_owner_registry *owners;
 #endif
 	struct gendisk *disk;
 	/* Prevent concurrent execution of device init */
@@ -139,7 +146,8 @@ struct zram {
 void zram_slot_lock(struct zram *zram, u32 index);
 void zram_slot_unlock(struct zram *zram, u32 index);
 void zram_slot_update(struct zram *zram, u32 index, unsigned long handle,
-			unsigned int comp_len);
+			unsigned int comp_len,
+			const struct zram_backend_owner *owner);
 
 unsigned long zram_get_handle(struct zram *zram, u32 index);
 size_t zram_get_obj_size(struct zram *zram, u32 index);

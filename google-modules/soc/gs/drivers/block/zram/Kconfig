@@ -54,8 +54,9 @@ config ZRAM_SEGMENT_BACKEND
 	  Build the compressed-record backend with single-owner batch packing,
 	  synchronous block I/O, record reads and release. Configuration and
 	  submission are internal APIs only: the legacy writeback entry point
-	  is not switched to this backend. Real App attribution, slot commit
-	  integration and garbage collection migration are not implemented.
+	  is not switched to this backend. Explicit UID/memcg mappings and slot
+	  owner propagation are provided; the target-specific attribution provider,
+	  backend slot commit and garbage collection migration are not implemented.
 
 config ZRAM_SEGMENT_BACKEND_KUNIT_TEST
 	bool "KUnit tests for the segment backend"

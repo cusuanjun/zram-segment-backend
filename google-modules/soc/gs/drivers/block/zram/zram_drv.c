@@ -1175,6 +1175,7 @@ static void zram_meta_free(struct zram *zram, u64 disksize)
 	}
 
 	zram_backend_destroy(zram);
+	zram_owner_destroy(zram);
 	zs_destroy_pool(zram->mem_pool);
 	vfree(zram->table);
 }
@@ -1194,7 +1195,8 @@ static bool zram_meta_alloc(struct zram *zram, u64 disksize)
 		return false;
 	}
 
-	if (zram_backend_init(zram)) {
+	if (zram_owner_init(zram) || zram_backend_init(zram)) {
+		zram_owner_destroy(zram);
 		zs_destroy_pool(zram->mem_pool);
 		vfree(zram->table);
 		zram->mem_pool = NULL;
@@ -1206,7 +1208,8 @@ static bool zram_meta_alloc(struct zram *zram, u64 disksize)
 }
 
 void zram_slot_update(struct zram *zram, u32 index,
-		unsigned long handle, unsigned int comp_len)
+		unsigned long handle, unsigned int comp_len,
+		const struct zram_backend_owner *owner)
 {
 	unsigned long alloced_pages;
 
@@ -1217,6 +1220,10 @@ void zram_slot_update(struct zram *zram, u32 index,
 	zram_slot_lock(zram, index);
 	__this_cpu_inc(zram->pcp_stats->items[NR_PAGE_STORED]);
 	zram_free_page(zram, index);
+#ifdef CONFIG_ZRAM_SEGMENT_BACKEND
+	/* Install identity with this content, including SAME and RAW records. */
+	zram->table[index].owner = *owner;
+#endif
 
 	if (comp_len == 0) {
 		zram_set_flag(zram, index, ZRAM_SAME);
@@ -1249,6 +1256,11 @@ void zram_slot_update(struct zram *zram, u32 index,
 static void zram_free_page(struct zram *zram, size_t index)
 {
 	unsigned long handle;
+
+#ifdef CONFIG_ZRAM_SEGMENT_BACKEND
+	/* Clear even for an empty slot; a later write must never inherit owner. */
+	zram->table[index].owner = (struct zram_backend_owner) {};
+#endif
 
 #ifdef CONFIG_ZRAM_MEMORY_TRACKING
 	zram->table[index].ac_time = 0;

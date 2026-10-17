@@ -25,6 +25,7 @@ struct zcomp_cookie {
 	u32 index; /* requested page-sized block index in zram block */
 	struct page *page; /* requested page for compression */
 	struct bio *bio;
+	struct zram_backend_owner owner; /* copied before asynchronous dispatch */
 	struct list_head list; /* list for page pool at idle */
 			       /* list for pended io at active */
 };

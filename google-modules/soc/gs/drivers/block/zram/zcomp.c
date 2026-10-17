@@ -337,9 +337,10 @@ int zcomp_compress(struct zcomp *comp, u32 index, struct page *page,
 	int ret = 1;
 	unsigned long element;
 	struct zcomp_cookie *cookie;
+	struct zram_backend_owner owner = zram_owner_capture(comp->zram, page);
 
 	if (zcomp_page_same_pattern(page, &element)) {
-		zram_slot_update(comp->zram, index, element, 0);
+		zram_slot_update(comp->zram, index, element, 0, &owner);
 		return 0;
 	}
 
@@ -351,6 +352,7 @@ int zcomp_compress(struct zcomp *comp, u32 index, struct page *page,
 		cookie->index = index;
 		cookie->page = page;
 		cookie->bio = bio;
+		cookie->owner = owner;
 
 		return comp->op->compress(comp, page, cookie);
 	}
@@ -363,6 +365,7 @@ int zcomp_compress(struct zcomp *comp, u32 index, struct page *page,
 	cookie->index = index;
 	cookie->page = page;
 	cookie->bio = bio;
+	cookie->owner = owner;
 	/*
 	 * Since __zram_make_request has bio_endio, zcomp_async needs
 	 * to hold the bio completion until the IO request is done if
@@ -521,7 +524,7 @@ int zcomp_copy_buffer(int err, void *buffer, int comp_len,
 		memcpy(dst_addr, buffer, comp_len);
 	}
 	zs_unmap_object(zram->mem_pool, handle);
-	zram_slot_update(zram, index, handle, comp_len);
+	zram_slot_update(zram, index, handle, comp_len, &cookie->owner);
 out:
 	if (zcomp_async(zram->comp)) {
 		if (!bio) { /* rw_page case */
