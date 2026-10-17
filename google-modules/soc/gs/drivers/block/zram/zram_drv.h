@@ -91,10 +91,15 @@ struct zram_stats {
 	long items[NR_ZRAM_STAT_ITEM];
 };
 
+struct zram_backend;
+
 struct zram {
 	struct zram_table_entry *table;
 	struct zs_pool *mem_pool;
 	struct zcomp *comp;
+#ifdef CONFIG_ZRAM_SEGMENT_BACKEND
+	struct zram_backend *backend;
+#endif
 	struct gendisk *disk;
 	/* Prevent concurrent execution of device init */
 	struct rw_semaphore init_lock;

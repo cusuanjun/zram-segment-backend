@@ -36,6 +36,7 @@
 #include <soc/google/meminfo.h>
 
 #include "zram_drv.h"
+#include "zram_backend.h"
 
 #undef CREATE_TRACE_POINTS
 #include <trace/events/zram.h>
@@ -1173,6 +1174,7 @@ static void zram_meta_free(struct zram *zram, u64 disksize)
 		zram_slot_unlock(zram, index);
 	}
 
+	zram_backend_destroy(zram);
 	zs_destroy_pool(zram->mem_pool);
 	vfree(zram->table);
 }
@@ -1189,6 +1191,14 @@ static bool zram_meta_alloc(struct zram *zram, u64 disksize)
 	zram->mem_pool = zs_create_pool(zram->disk->disk_name);
 	if (!zram->mem_pool) {
 		vfree(zram->table);
+		return false;
+	}
+
+	if (zram_backend_init(zram)) {
+		zs_destroy_pool(zram->mem_pool);
+		vfree(zram->table);
+		zram->mem_pool = NULL;
+		zram->table = NULL;
 		return false;
 	}
 

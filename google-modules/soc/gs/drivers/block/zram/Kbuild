@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: GPL-2.0-only
 zram_gs-y	:=	zcomp.o zram_drv.o
+zram_gs-$(CONFIG_ZRAM_SEGMENT_BACKEND) += zram_backend.o
+
+obj-$(CONFIG_ZRAM_SEGMENT_BACKEND_KUNIT_TEST) += zram_backend_test.o
 
 obj-$(CONFIG_ZRAM_GS)	+=	zram_gs.o
 obj-$(CONFIG_ZCOMP_CPU)	+=	zcomp_cpu.o
