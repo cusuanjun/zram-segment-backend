@@ -130,6 +130,10 @@ struct page;
 typedef int (*zram_backend_test_io_fn)(void *private, u64 offset,
 				      struct page **pages, unsigned int nr_pages,
 				      unsigned int bytes, bool write);
+/* Test-only snapshots/audit; init_lock held for read, no live pointers returned. */
+int zram_backend_test_validate_indexes(struct zram *zram);
+int zram_backend_test_segment_records(struct zram *zram, u64 segment_id,
+				      u64 *ids, unsigned int capacity);
 /* Test-only memory transport: never reserves or touches a real device. */
 int zram_backend_test_configure(struct zram *zram, u64 segment_bytes,
 				unsigned int nr_segments, unsigned int block_size,

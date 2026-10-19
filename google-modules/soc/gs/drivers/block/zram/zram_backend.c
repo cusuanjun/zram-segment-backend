@@ -31,6 +31,8 @@ enum zram_backend_segment_state {
 };
 
 struct zram_backend_segment {
+	/* Only published live records; protected by backend->lock. */
+	struct list_head record_list;
 	struct zram_backend_owner owner;
 	u64 generation;
 	u64 start;
@@ -44,7 +46,8 @@ struct zram_backend_segment {
 };
 
 struct zram_backend_record {
-	struct list_head node;
+	struct list_head node; /* global ID lookup */
+	struct list_head segment_node; /* owning segment's live-record index */
 	u64 id;
 	struct zram_backend_record_info info;
 };
@@ -218,8 +221,10 @@ static int setup_segments(struct zram_backend *backend, u64 start,
 	backend->nr_segments = nr_segments;
 	backend->block_size = block_size;
 	backend->segment_bytes = segment_bytes;
-	for (i = 0; i < nr_segments; i++)
+	for (i = 0; i < nr_segments; i++) {
+		INIT_LIST_HEAD(&backend->segments[i].record_list);
 		backend->segments[i].start = start + (u64)i * segment_bytes;
+	}
 	return 0;
 }
 
@@ -323,10 +328,38 @@ select_segment(struct zram_backend *backend, const struct zram_backend_owner *ow
 	return free_segment;
 }
 
+/*
+ * Publish/remove both indexes and their accounting under backend->lock.
+ * These helpers do not allocate, issue I/O or free the record. A future GC move
+ * needs a separate transfer operation: it must preserve the global ID entry.
+ */
+static void publish_record(struct zram_backend *backend,
+			   struct zram_backend_segment *segment,
+			   struct zram_backend_record *record)
+{
+	list_add_tail(&record->node, &backend->records);
+	list_add_tail(&record->segment_node, &segment->record_list);
+	segment->records++;
+	segment->live_bytes += record->info.location.payload_len;
+}
+
+static void unpublish_record(struct zram_backend_segment *segment,
+			     struct zram_backend_record *record)
+{
+	list_del(&record->node);
+	list_del(&record->segment_node);
+	segment->records--;
+	segment->live_bytes -= record->info.location.payload_len;
+	segment->invalid_bytes += record->info.location.payload_len;
+}
+
 /* The backend lock excludes all synchronous reads/writes at this point. */
 static void recycle_empty_segment(struct zram_backend_segment *segment)
 {
 	if (segment->records)
+		return;
+	/* Never recycle a count-zero segment that still owns live records. */
+	if (WARN_ON_ONCE(!list_empty(&segment->record_list) || segment->live_bytes))
 		return;
 	memset(&segment->owner, 0, sizeof(segment->owner));
 	segment->append_tail = 0;
@@ -434,12 +467,10 @@ static int write_one(struct zram_backend *backend,
 		record->info.location.offset = offset + cursor;
 		record->info.location.payload_len = input->len;
 		record->info.location.stored_len = input->len;
-		list_add_tail(&record->node, &backend->records);
+		publish_record(backend, segment, record);
 		record_ids[indices[i]] = record->id;
 		cursor += input->len;
 	}
-	segment->records += nr_records;
-	segment->live_bytes += payload_bytes;
 	segment->padding_bytes += io_bytes - payload_bytes;
 	return 0;
 
@@ -636,10 +667,7 @@ int zram_backend_release(struct zram *zram, u64 record_id)
 		goto out;
 	}
 	segment = &backend->segments[record->info.location.segment_id];
-	segment->live_bytes -= record->info.location.payload_len;
-	segment->invalid_bytes += record->info.location.payload_len;
-	segment->records--;
-	list_del(&record->node);
+	unpublish_record(segment, record);
 	kfree(record);
 	recycle_empty_segment(segment);
 out:
@@ -688,7 +716,10 @@ void zram_backend_destroy(struct zram *zram)
 	 */
 	zram->backend = NULL;
 	list_for_each_entry_safe(record, next, &backend->records, node) {
-		list_del(&record->node);
+		struct zram_backend_segment *segment;
+
+		segment = &backend->segments[record->info.location.segment_id];
+		unpublish_record(segment, record);
 		kfree(record);
 	}
 	if (backend->reserved_pages)
@@ -700,6 +731,93 @@ void zram_backend_destroy(struct zram *zram)
 }
 
 #ifdef CONFIG_ZRAM_SEGMENT_BACKEND_KUNIT_TEST
+/*
+ * Slow test-only consistency audit. No pointers escape the mutex; this is not
+ * a GC iterator or production lookup interface.
+ */
+int zram_backend_test_validate_indexes(struct zram *zram)
+{
+	struct zram_backend *backend = zram->backend;
+	struct zram_backend_record *record;
+	u64 global_count = 0, segment_count = 0;
+	unsigned int i;
+	int ret = -EINVAL;
+
+	if (!backend)
+		return -ENODEV;
+	mutex_lock(&backend->lock);
+	for (i = 0; i < backend->nr_segments; i++) {
+		struct zram_backend_segment *segment = &backend->segments[i];
+		u64 count = 0, live = 0;
+
+		list_for_each_entry(record, &segment->record_list, segment_node) {
+			struct zram_backend_location *loc = &record->info.location;
+
+			if (loc->segment_id != i ||
+			    loc->segment_generation != segment->generation ||
+			    !same_owner(&record->info.owner, &segment->owner) ||
+			    !loc->payload_len || loc->offset > segment->append_tail ||
+			    loc->payload_len > segment->append_tail - loc->offset ||
+			    find_record(backend, record->id) != record)
+				goto out;
+			count++;
+			live += loc->payload_len;
+		}
+		if (count != segment->records || live != segment->live_bytes ||
+		    segment->append_tail > backend->segment_bytes ||
+		    segment->append_tail != live + segment->invalid_bytes +
+					    segment->padding_bytes + segment->failed_bytes)
+			goto out;
+		if (segment->state == ZRAM_BACKEND_SEGMENT_FREE &&
+		    (count || segment->append_tail || segment->owner.id))
+			goto out;
+		segment_count += count;
+	}
+	list_for_each_entry(record, &backend->records, node)
+		global_count++;
+	if (global_count != segment_count)
+		goto out;
+	ret = 0;
+out:
+	mutex_unlock(&backend->lock);
+	return ret;
+}
+
+/* Snapshot IDs in segment-list order. Capacity errors leave output untouched. */
+int zram_backend_test_segment_records(struct zram *zram, u64 segment_id,
+				      u64 *ids, unsigned int capacity)
+{
+	struct zram_backend *backend = zram->backend;
+	struct zram_backend_record *record;
+	struct zram_backend_segment *segment;
+	u64 count = 0;
+	unsigned int i = 0;
+	int ret;
+
+	if (!backend)
+		return -ENODEV;
+	if (!ids && capacity)
+		return -EINVAL;
+	mutex_lock(&backend->lock);
+	if (segment_id >= backend->nr_segments) {
+		ret = -EINVAL;
+		goto out;
+	}
+	segment = &backend->segments[segment_id];
+	list_for_each_entry(record, &segment->record_list, segment_node)
+		count++;
+	if (count > INT_MAX || count > capacity) {
+		ret = -ENOSPC;
+		goto out;
+	}
+	list_for_each_entry(record, &segment->record_list, segment_node)
+		ids[i++] = record->id;
+	ret = i;
+out:
+	mutex_unlock(&backend->lock);
+	return ret;
+}
+
 int zram_backend_test_configure(struct zram *zram, u64 segment_bytes,
 				unsigned int nr_segments, unsigned int block_size,
 				zram_backend_test_io_fn submit, void *private)
