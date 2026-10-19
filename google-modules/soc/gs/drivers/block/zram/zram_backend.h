@@ -67,7 +67,9 @@ void zram_backend_destroy(struct zram *zram);
  * The device logical block size must be a power of two in [512, PAGE_SIZE].
  * Reserves one reusable write buffer of at most 64 pages, further capped by
  * segment size and BIO_MAX_VECS. Allocation failure leaves the backend
- * unconfigured. No guessed segment size or sysfs activation is provided.
+ * unconfigured. Requires at least two segments; ordinary allocation preserves
+ * one usable free segment for GC. Existing owned tails remain writable.
+ * No guessed segment size or sysfs activation is provided.
  */
 int zram_backend_configure(struct zram *zram, u64 start, u64 bytes,
 			   u64 segment_bytes);
@@ -113,6 +115,18 @@ int zram_backend_read(struct zram *zram, u64 record_id, void *dst,
  * A future slot adapter needs reference pinning/deferred release.
  */
 int zram_backend_release(struct zram *zram, u64 record_id);
+/*
+ * Explicit synchronous compaction into one fresh segment of the same owner.
+ * Expected generation rejects stale victim selections. IDs remain unchanged.
+ * Reads/writes/releases are serialized by the backend mutex for the whole move.
+ * All destination writes precede the mapping commit; on any I/O/allocation
+ * error, ALL source mappings remain unchanged and the destination is recycled.
+ * EALREADY: no whole block of tail can be recovered; ESTALE: victim was reused
+ * or freed. ENOSPC: no usable free destination. No automatic victim selection.
+ * Needs two temporary scratch pages; does not guarantee low-memory progress.
+ */
+int zram_backend_gc_segment(struct zram *zram, u64 segment_id,
+			    u64 segment_generation);
 int zram_backend_get_stats(struct zram *zram, struct zram_backend_stats *stats);
 #else
 static inline int zram_backend_init(struct zram *zram)

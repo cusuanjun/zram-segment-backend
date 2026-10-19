@@ -56,14 +56,16 @@ config ZRAM_SEGMENT_BACKEND
 	  submission are internal APIs only: the legacy writeback entry point
 	  is not switched to this backend. Explicit UID/memcg mappings and slot
 	  owner propagation are provided; the target-specific attribution provider,
-	  backend slot commit and garbage collection migration are not implemented.
+	  backend slot commit and automatic GC scheduling are not implemented.
+	  Explicit synchronous segment compaction preserves record IDs and keeps
+	  one free segment reserved from ordinary allocation.
 
 config ZRAM_SEGMENT_BACKEND_KUNIT_TEST
 	bool "KUnit tests for the segment backend"
 	depends on KUNIT=y && ZRAM_GS=y && ZRAM_SEGMENT_BACKEND
 	default n
 	help
-	  Test packing, ownership isolation, I/O failure and segment reuse
+	  Test packing, ownership isolation, I/O failure, segment reuse and GC
 	  with an in-memory transport. No real block device is accessed.
 	  Built-in only; these tests use internal, non-exported backend APIs.
 

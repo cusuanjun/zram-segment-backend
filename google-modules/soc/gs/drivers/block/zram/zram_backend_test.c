@@ -15,12 +15,14 @@
 
 #define TEST_BLOCK_SIZE 4096
 #define TEST_SEGMENT_BYTES (4 * PAGE_SIZE)
-#define TEST_SEGMENTS 2
+#define TEST_SEGMENTS 3
 
 struct backend_fixture {
 	struct zram zram;
 	u8 *storage;
 	unsigned int writes;
+	unsigned int reads;
+	unsigned int fail_read_at;
 	unsigned int last_write_bytes;
 	unsigned int fail_write_at;
 	struct page *first_write_page;
@@ -52,8 +54,10 @@ static int memory_io(void *private, u64 offset, struct page **pages,
 			memcpy(fixture->storage + offset, page_address(pages[0]), 128);
 			return -EIO;
 		}
-	} else if (fixture->fail_read) {
-		return -EIO;
+	} else {
+		fixture->reads++;
+		if (fixture->fail_read || fixture->reads == fixture->fail_read_at)
+			return -EIO;
 	}
 	for (i = 0; i < nr_pages; i++) {
 		unsigned int count = min_t(unsigned int, remaining, PAGE_SIZE);
@@ -148,13 +152,13 @@ static void packed_records_roundtrip(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, zram_backend_get_stats(&fixture->zram, &stats), 0);
 	KUNIT_EXPECT_EQ(test, stats.live_bytes, (u64)4600);
 	KUNIT_EXPECT_EQ(test, stats.padding_bytes, (u64)3592);
-	KUNIT_EXPECT_EQ(test, stats.free_segments, (u64)1);
+	KUNIT_EXPECT_EQ(test, stats.free_segments, (u64)(TEST_SEGMENTS - 1));
 	KUNIT_ASSERT_EQ(test, zram_backend_release(&fixture->zram, ids[1]), 0);
 	KUNIT_ASSERT_EQ(test, zram_backend_get_stats(&fixture->zram, &stats), 0);
 	KUNIT_EXPECT_EQ(test, stats.live_bytes, (u64)2800);
 	KUNIT_EXPECT_EQ(test, stats.invalid_bytes, (u64)1800);
 	KUNIT_EXPECT_EQ(test, stats.padding_bytes, (u64)3592);
-	KUNIT_EXPECT_EQ(test, stats.free_segments, (u64)1);
+	KUNIT_EXPECT_EQ(test, stats.free_segments, (u64)(TEST_SEGMENTS - 1));
 	KUNIT_ASSERT_EQ(test, zram_backend_read(&fixture->zram, ids[2], output,
 					      PAGE_SIZE, &info), 0);
 	KUNIT_EXPECT_EQ(test, memcmp(output, inputs[2].data, lengths[2]), 0);
@@ -501,7 +505,7 @@ static void window_failure_preserves_earlier_ids(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, output, data);
 	KUNIT_ASSERT_EQ(test, zram_backend_get_stats(&fixture->zram, &stats), 0);
 	KUNIT_EXPECT_EQ(test, stats.records, (u64)2);
-	KUNIT_EXPECT_EQ(test, stats.free_segments, (u64)1);
+	KUNIT_EXPECT_EQ(test, stats.free_segments, (u64)(TEST_SEGMENTS - 1));
 	/* Retry only the zero-ID record, not the whole original window. */
 	fixture->fail_write_at = 0;
 	KUNIT_ASSERT_EQ(test, zram_backend_write_records(&fixture->zram, &inputs[1], 1,
@@ -510,7 +514,7 @@ static void window_failure_preserves_earlier_ids(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, zram_backend_release(&fixture->zram, ids[1]), 0);
 	KUNIT_ASSERT_EQ(test, zram_backend_release(&fixture->zram, ids[2]), 0);
 	KUNIT_ASSERT_EQ(test, zram_backend_get_stats(&fixture->zram, &stats), 0);
-	KUNIT_EXPECT_EQ(test, stats.free_segments, (u64)2);
+	KUNIT_EXPECT_EQ(test, stats.free_segments, (u64)TEST_SEGMENTS);
 }
 
 static void window_capacity_and_validation(struct kunit *test)
@@ -641,7 +645,7 @@ static void segment_index_excludes_failed_writes(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, stats.records, (u64)1);
 	KUNIT_EXPECT_EQ(test, stats.live_bytes, (u64)1);
 	KUNIT_EXPECT_EQ(test, stats.failed_bytes, (u64)TEST_BLOCK_SIZE);
-	KUNIT_EXPECT_EQ(test, stats.free_segments, (u64)1);
+	KUNIT_EXPECT_EQ(test, stats.free_segments, (u64)(TEST_SEGMENTS - 1));
 }
 
 static void segment_index_spans_multiple_segments(struct kunit *test)
@@ -685,7 +689,156 @@ static void segment_index_spans_multiple_segments(struct kunit *test)
 				last.location.segment_id, NULL, 0), 0);
 }
 
+
+static void gc_compacts_and_preserves_ids(struct kunit *test)
+{
+	struct backend_fixture *f = test->priv;
+	struct zram_backend_input inputs[4] = {};
+	struct zram_backend_record_info old, info;
+	struct zram_backend_stats before, after;
+	u8 *data = kunit_kmalloc(test, PAGE_SIZE, GFP_KERNEL);
+	u8 *output = kunit_kmalloc(test, PAGE_SIZE, GFP_KERNEL);
+	u64 ids[4], other, rejected, replacement;
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	KUNIT_ASSERT_NOT_NULL(test, output);
+	for (i = 0; i < PAGE_SIZE; i++)
+		data[i] = (u8)(i * 17);
+	for (i = 0; i < 4; i++) {
+		inputs[i].owner.id = 1;
+		inputs[i].owner.generation = 9;
+		inputs[i].data = data;
+		inputs[i].len = PAGE_SIZE;
+		inputs[i].format = ZRAM_BACKEND_RAW;
+	}
+	KUNIT_ASSERT_EQ(test, zram_backend_write_batch(&f->zram, inputs, 4, ids), 0);
+	KUNIT_ASSERT_EQ(test, zram_backend_read(&f->zram, ids[0], output, PAGE_SIZE, &old), 0);
+	KUNIT_EXPECT_EQ(test, zram_backend_gc_segment(&f->zram,
+		old.location.segment_id, old.location.segment_generation), -EALREADY);
+	inputs[0].owner.id = 2;
+	KUNIT_ASSERT_EQ(test, zram_backend_write_batch(&f->zram, inputs, 1, &other), 0);
+	inputs[0].owner.id = 3;
+	/* A physically free segment exists, but ordinary writes cannot take it. */
+	KUNIT_EXPECT_EQ(test, zram_backend_write_batch(&f->zram, inputs, 1, &rejected), -ENOSPC);
+	KUNIT_EXPECT_EQ(test, rejected, (u64)0);
+	KUNIT_ASSERT_EQ(test, zram_backend_release(&f->zram, ids[1]), 0);
+	KUNIT_ASSERT_EQ(test, zram_backend_release(&f->zram, ids[3]), 0);
+	KUNIT_ASSERT_EQ(test, zram_backend_get_stats(&f->zram, &before), 0);
+	KUNIT_ASSERT_EQ(test, zram_backend_gc_segment(&f->zram,
+		old.location.segment_id, old.location.segment_generation), 0);
+	for (i = 0; i < 4; i += 2) {
+		KUNIT_ASSERT_EQ(test, zram_backend_read(&f->zram, ids[i], output, PAGE_SIZE, &info), 0);
+		KUNIT_EXPECT_NE(test, info.location.segment_id, old.location.segment_id);
+		KUNIT_EXPECT_EQ(test, info.location.offset, (u64)(i / 2 * PAGE_SIZE));
+		KUNIT_EXPECT_EQ(test, info.owner.id, (u64)1);
+		KUNIT_EXPECT_EQ(test, info.owner.generation, (u64)9);
+		KUNIT_EXPECT_EQ(test, info.format, ZRAM_BACKEND_RAW);
+		KUNIT_EXPECT_EQ(test, memcmp(data, output, PAGE_SIZE), 0);
+	}
+	KUNIT_ASSERT_EQ(test, zram_backend_get_stats(&f->zram, &after), 0);
+	KUNIT_EXPECT_EQ(test, after.records, before.records);
+	KUNIT_EXPECT_EQ(test, after.live_bytes, before.live_bytes);
+	KUNIT_EXPECT_EQ(test, after.free_segments, (u64)1);
+	KUNIT_EXPECT_EQ(test, after.invalid_bytes, (u64)0);
+	KUNIT_EXPECT_EQ(test, zram_backend_test_segment_records(&f->zram,
+		old.location.segment_id, NULL, 0), 0);
+	KUNIT_EXPECT_EQ(test, zram_backend_gc_segment(&f->zram,
+		old.location.segment_id, old.location.segment_generation), -ESTALE);
+	/* Reclaimed tail is available to the same App even with only one spare. */
+	inputs[0].owner = inputs[1].owner;
+	KUNIT_ASSERT_EQ(test, zram_backend_write_batch(&f->zram, inputs, 1, &replacement), 0);
+	KUNIT_ASSERT_EQ(test, zram_backend_read(&f->zram, other, output, PAGE_SIZE, &info), 0);
+	KUNIT_EXPECT_EQ(test, info.owner.id, (u64)2);
+	KUNIT_EXPECT_EQ(test, memcmp(data, output, PAGE_SIZE), 0);
+}
+
+static void gc_errors_preserve_source(struct kunit *test)
+{
+	struct backend_fixture *f = test->priv;
+	struct zram_backend_record_info old, info;
+	struct zram_backend_stats before, after;
+	u8 data[100], output[100];
+	struct zram_backend_input input = {
+		.owner = { 1, 3 }, .data = data, .len = sizeof(data),
+	};
+	u64 ids[3];
+	unsigned int i;
+
+	memset(data, 0x5d, sizeof(data));
+	for (i = 0; i < 3; i++)
+		KUNIT_ASSERT_EQ(test, zram_backend_write_batch(&f->zram, &input, 1, &ids[i]), 0);
+	KUNIT_ASSERT_EQ(test, zram_backend_release(&f->zram, ids[1]), 0);
+	KUNIT_ASSERT_EQ(test, zram_backend_read(&f->zram, ids[0], output, sizeof(output), &old), 0);
+	KUNIT_ASSERT_EQ(test, zram_backend_get_stats(&f->zram, &before), 0);
+	KUNIT_EXPECT_EQ(test, zram_backend_gc_segment(&f->zram,
+		TEST_SEGMENTS, old.location.segment_generation), -EINVAL);
+	KUNIT_EXPECT_EQ(test, zram_backend_gc_segment(&f->zram,
+		old.location.segment_id, old.location.segment_generation + 1), -ESTALE);
+	for (i = 0; i < 2; i++) {
+		f->fail_read = i == 0;
+		f->fail_write = i == 1;
+		KUNIT_EXPECT_EQ(test, zram_backend_gc_segment(&f->zram,
+			old.location.segment_id, old.location.segment_generation), -EIO);
+		f->fail_read = false;
+		f->fail_write = false;
+		KUNIT_ASSERT_EQ(test, zram_backend_read(&f->zram, ids[0], output, sizeof(output), &info), 0);
+		KUNIT_EXPECT_EQ(test, info.location.segment_id, old.location.segment_id);
+		KUNIT_EXPECT_EQ(test, info.location.segment_generation, old.location.segment_generation);
+		KUNIT_EXPECT_EQ(test, info.location.offset, old.location.offset);
+		KUNIT_EXPECT_EQ(test, memcmp(data, output, sizeof(data)), 0);
+		KUNIT_ASSERT_EQ(test, zram_backend_get_stats(&f->zram, &after), 0);
+		KUNIT_EXPECT_EQ(test, after.free_segments, before.free_segments);
+		KUNIT_EXPECT_EQ(test, after.invalid_bytes, before.invalid_bytes);
+		KUNIT_EXPECT_EQ(test, after.padding_bytes, before.padding_bytes);
+		KUNIT_EXPECT_EQ(test, after.live_bytes, before.live_bytes);
+		KUNIT_ASSERT_EQ(test, zram_backend_test_validate_indexes(&f->zram), 0);
+	}
+	KUNIT_ASSERT_EQ(test, zram_backend_gc_segment(&f->zram,
+		old.location.segment_id, old.location.segment_generation), 0);
+	KUNIT_ASSERT_EQ(test, zram_backend_read(&f->zram, ids[2], output, sizeof(output), &info), 0);
+	KUNIT_EXPECT_EQ(test, info.location.offset, (u64)100);
+	KUNIT_EXPECT_EQ(test, memcmp(data, output, sizeof(data)), 0);
+	for (i = 200; i < TEST_BLOCK_SIZE; i++)
+		KUNIT_EXPECT_EQ(test, f->storage[info.location.segment_id * TEST_SEGMENT_BYTES + i], (u8)0);
+}
+
+static void gc_preserves_cross_page_records(struct kunit *test)
+{
+	struct backend_fixture *f = test->priv;
+	struct zram_backend_record_info old, info;
+	struct zram_backend_input inputs[3] = {};
+	u8 *data = kunit_kmalloc(test, PAGE_SIZE, GFP_KERNEL);
+	u8 *output = kunit_kmalloc(test, PAGE_SIZE, GFP_KERNEL);
+	u64 ids[3], discarded;
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	KUNIT_ASSERT_NOT_NULL(test, output);
+	for (i = 0; i < PAGE_SIZE; i++)
+		data[i] = (u8)(i * 13);
+	for (i = 0; i < 3; i++) {
+		inputs[i].owner.id = 1;
+		inputs[i].data = data;
+		inputs[i].len = PAGE_SIZE / 2 + 1;
+	}
+	KUNIT_ASSERT_EQ(test, zram_backend_write_batch(&f->zram, inputs, 3, ids), 0);
+	KUNIT_ASSERT_EQ(test, zram_backend_write_batch(&f->zram, inputs, 1, &discarded), 0);
+	KUNIT_ASSERT_EQ(test, zram_backend_release(&f->zram, discarded), 0);
+	KUNIT_ASSERT_EQ(test, zram_backend_read(&f->zram, ids[0], output, PAGE_SIZE, &old), 0);
+	KUNIT_ASSERT_EQ(test, zram_backend_gc_segment(&f->zram,
+		old.location.segment_id, old.location.segment_generation), 0);
+	for (i = 0; i < 3; i++) {
+		KUNIT_ASSERT_EQ(test, zram_backend_read(&f->zram, ids[i], output, PAGE_SIZE, &info), 0);
+		KUNIT_EXPECT_EQ(test, memcmp(data, output, inputs[i].len), 0);
+		KUNIT_EXPECT_EQ(test, info.format, ZRAM_BACKEND_COMPRESSED);
+	}
+}
+
 static struct kunit_case backend_test_cases[] = {
+	KUNIT_CASE(gc_compacts_and_preserves_ids),
+	KUNIT_CASE(gc_errors_preserve_source),
+	KUNIT_CASE(gc_preserves_cross_page_records),
 	KUNIT_CASE(packed_records_roundtrip),
 	KUNIT_CASE(owner_validation),
 	KUNIT_CASE(failed_batch_is_not_published),

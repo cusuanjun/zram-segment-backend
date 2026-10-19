@@ -4,7 +4,7 @@
  *
  * This backend is NOT connected to legacy ZRAM_WB entries. Configuration is
  * explicit and excludes its address range from the legacy bitmap allocator.
- * Metadata is volatile: no crash recovery, automatic flushing or GC migration.
+ * Metadata is volatile: no crash recovery or automatic flushing/GC scheduling.
  * A single mutex serializes allocation, synchronous I/O and release initially.
  */
 #include <linux/bio.h>
@@ -195,7 +195,7 @@ static int setup_segments(struct zram_backend *backend, u64 start,
 
 	if (backend->segments)
 		return -EBUSY;
-	if (!nr_segments || !segment_bytes ||
+	if (nr_segments < 2 || !segment_bytes ||
 	    !IS_ALIGNED(segment_bytes, PAGE_SIZE) ||
 	    !is_power_of_2(block_size) || block_size < 512 ||
 	    block_size > PAGE_SIZE || !IS_ALIGNED(start, PAGE_SIZE))
@@ -302,14 +302,17 @@ select_segment(struct zram_backend *backend, const struct zram_backend_owner *ow
 	       unsigned int bytes)
 {
 	struct zram_backend_segment *free_segment = NULL;
-	unsigned int i;
+	unsigned int i, usable_free = 0;
 
 	for (i = 0; i < backend->nr_segments; i++) {
 		struct zram_backend_segment *segment = &backend->segments[i];
 
 		if (segment->state == ZRAM_BACKEND_SEGMENT_FREE) {
-			if (!free_segment && segment->generation != U64_MAX)
-				free_segment = segment;
+			if (segment->generation != U64_MAX) {
+				usable_free++;
+				if (!free_segment)
+					free_segment = segment;
+			}
 			continue;
 		}
 		if (segment->state != ZRAM_BACKEND_SEGMENT_OPEN ||
@@ -319,7 +322,8 @@ select_segment(struct zram_backend *backend, const struct zram_backend_owner *ow
 			return segment;
 	}
 
-	if (!free_segment)
+	/* Ordinary writes may append to owned tails, but keep one GC spare. */
+	if (!free_segment || usable_free <= 1)
 		return NULL;
 	/* Keep older non-full tails OPEN for later smaller records of this owner. */
 	free_segment->owner = *owner;
@@ -330,8 +334,8 @@ select_segment(struct zram_backend *backend, const struct zram_backend_owner *ow
 
 /*
  * Publish/remove both indexes and their accounting under backend->lock.
- * These helpers do not allocate, issue I/O or free the record. A future GC move
- * needs a separate transfer operation: it must preserve the global ID entry.
+ * These helpers do not allocate, issue I/O or free the record. GC transfers
+ * only the segment node, preserving the global ID entry.
  */
 static void publish_record(struct zram_backend *backend,
 			   struct zram_backend_segment *segment,
@@ -670,6 +674,172 @@ int zram_backend_release(struct zram *zram, u64 record_id)
 	unpublish_record(segment, record);
 	kfree(record);
 	recycle_empty_segment(segment);
+out:
+	mutex_unlock(&backend->lock);
+	return ret;
+}
+
+
+/* Copy between page arrays without allocating a payload-sized snapshot. */
+static void buffer_transfer(struct zram_backend_buffer *dst, unsigned int to,
+			    struct zram_backend_buffer *src, unsigned int from,
+			    unsigned int bytes)
+{
+	while (bytes) {
+		unsigned int count = min_t(unsigned int, bytes,
+					   PAGE_SIZE - from % PAGE_SIZE);
+		void *data = (u8 *)page_address(src->pages[from / PAGE_SIZE]) +
+			     from % PAGE_SIZE;
+
+		buffer_copy(dst, to, data, count, true);
+		from += count;
+		to += count;
+		bytes -= count;
+	}
+}
+
+/* No live records reference dst until the entire copy has succeeded. */
+static int gc_flush(struct zram_backend *backend,
+		    struct zram_backend_segment *dst, unsigned int bytes)
+{
+	struct zram_backend_buffer *buffer = &backend->write_buffer;
+	int ret;
+
+	ret = backend->submit(backend->io_private, dst->start + dst->append_tail,
+			      buffer->pages, DIV_ROUND_UP(bytes, PAGE_SIZE), bytes, true);
+	if (!ret)
+		dst->append_tail += bytes;
+	return ret;
+}
+
+/* lock held; preserve the global index, ID, owner and format. */
+static void transfer_record(struct zram_backend *backend,
+			    struct zram_backend_segment *src,
+			    struct zram_backend_segment *dst,
+			    struct zram_backend_record *record, u64 offset)
+{
+	unsigned int bytes = record->info.location.payload_len;
+
+	list_del(&record->segment_node);
+	list_add_tail(&record->segment_node, &dst->record_list);
+	src->records--;
+	src->live_bytes -= bytes;
+	src->invalid_bytes += bytes;
+	dst->records++;
+	dst->live_bytes += bytes;
+	record->info.location.segment_id = dst - backend->segments;
+	record->info.location.segment_generation = dst->generation;
+	record->info.location.offset = offset;
+}
+
+int zram_backend_gc_segment(struct zram *zram, u64 segment_id,
+			    u64 segment_generation)
+{
+	struct zram_backend *backend = zram->backend;
+	struct zram_backend_segment *src, *dst = NULL;
+	struct zram_backend_record *record, *next;
+	struct zram_backend_buffer scratch;
+	struct zram_backend_buffer *buffer;
+	u64 cursor;
+	unsigned int i, used = 0;
+	int ret;
+
+	if (!backend)
+		return -ENODEV;
+	mutex_lock(&backend->lock);
+	if (!backend->segments) {
+		ret = -ENODEV;
+		goto out;
+	}
+	if (segment_id >= backend->nr_segments) {
+		ret = -EINVAL;
+		goto out;
+	}
+	src = &backend->segments[segment_id];
+	if (src->state == ZRAM_BACKEND_SEGMENT_FREE ||
+	    src->generation != segment_generation) {
+		ret = -ESTALE;
+		goto out;
+	}
+	/* Compact only when at least one logical block of tail is recovered. */
+	if (round_up(src->live_bytes, (u64)backend->block_size) >= src->append_tail) {
+		ret = -EALREADY;
+		goto out;
+	}
+	/* Entire compacted payload fits in one fresh segment. No tail sharing. */
+	for (i = 0; i < backend->nr_segments; i++) {
+		if (backend->segments[i].state == ZRAM_BACKEND_SEGMENT_FREE &&
+		    backend->segments[i].generation != U64_MAX) {
+			dst = &backend->segments[i];
+			break;
+		}
+	}
+	if (!dst) {
+		ret = -ENOSPC;
+		goto out;
+	}
+	/* One <= PAGE_SIZE record can cover at most two aligned pages. */
+	ret = buffer_alloc(&scratch, 2 * PAGE_SIZE);
+	if (ret)
+		goto out;
+	dst->owner = src->owner;
+	dst->generation++;
+	dst->state = ZRAM_BACKEND_SEGMENT_OPEN;
+	buffer = &backend->write_buffer;
+	list_for_each_entry(record, &src->record_list, segment_node) {
+		struct zram_backend_location *loc = &record->info.location;
+		u64 start = round_down(loc->offset, (u64)backend->block_size);
+		unsigned int prefix = loc->offset - start;
+		unsigned int bytes = round_up(prefix + loc->payload_len, backend->block_size);
+		unsigned int copied = 0;
+
+		ret = backend->submit(backend->io_private, src->start + start,
+				      scratch.pages, DIV_ROUND_UP(bytes, PAGE_SIZE),
+				      bytes, false);
+		if (ret)
+			goto abort;
+		while (copied < loc->payload_len) {
+			unsigned int count = min_t(unsigned int, loc->payload_len - copied,
+						   buffer->bytes - used);
+
+			buffer_transfer(buffer, used, &scratch, prefix + copied, count);
+			used += count;
+			copied += count;
+			if (used == buffer->bytes) {
+				ret = gc_flush(backend, dst, used);
+				if (ret)
+					goto abort;
+				used = 0;
+			}
+		}
+	}
+	if (used) {
+		unsigned int bytes = round_up(used, backend->block_size);
+
+		buffer_zero(buffer, used, bytes - used);
+		ret = gc_flush(backend, dst, bytes);
+		if (ret)
+			goto abort;
+	}
+	/* All I/O succeeded. This commit cannot allocate or fail under the lock. */
+	cursor = 0;
+	list_for_each_entry_safe(record, next, &src->record_list, segment_node) {
+		transfer_record(backend, src, dst, record, cursor);
+		cursor += record->info.location.payload_len;
+	}
+	dst->padding_bytes = dst->append_tail - dst->live_bytes;
+	if (dst->append_tail == backend->segment_bytes)
+		dst->state = ZRAM_BACKEND_SEGMENT_SEALED;
+	recycle_empty_segment(src);
+	ret = 0;
+	goto free_scratch;
+abort:
+	/* Synchronous I/O has ended; no mapping was published into this segment.
+	 * Stale/partially written bytes are unreachable and can be overwritten.
+	 */
+	recycle_empty_segment(dst);
+free_scratch:
+	buffer_free(&scratch);
 out:
 	mutex_unlock(&backend->lock);
 	return ret;
